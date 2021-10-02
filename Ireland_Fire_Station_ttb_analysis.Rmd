@@ -1,0 +1,139 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# Outline
+
+This notebook presents an analysis of travel-time boundaries from fire stations in the republic of Ireland, looking at the number of people and households within a specific drive-time of each fire station. The time-travel boundaries were generated using the OpenRouteService algorithm, with the following parameters;
+
+-   driving-car
+
+-   3,5,8,10,12,15,30 minute intervals
+
+(driving-car was used because the driving-hgv profile is not configured for some reason.... one could say it is an acceptable amalgram for fire appliance travel???)
+
+The OpenRouteService facility was set up to run locally, per this blog-post:
+
+<https://www.lint.ie/musings-on-data-blue-lights-and-maps/2021/9/21/open-source-time-travel-boundary-calculation> using the locations of Irish Fire Stations which were geolocated and are available to download at <https://www.lint.ie/musings-on-data-blue-lights-and-maps/2021/9/20/dataset-fire-stations-of-ireland>.
+
+# Preparation
+
+The ttb data was saved to a geopackage file, but will be made available as an open dataset in the accompanying blog-post.
+
+The demographic data is based on the Pobal dataset, available at [Pobal](https://maps.pobal.ie/), which creates a geography of deprivation / affluence and a "Deprivation Index". In my opinion, this is one of the most useful interpretations of the Census Data, as it gives longitudinal and derived information about key demographic information. To access it, go to the aforementioned url, and create a geoprofile of your area of interest. For this analysis, I selected every county in Ireland and build a geoprofile at Small Area level, the smallest granularity available.
+
+The Census Data is generalised to Small Area, which is a polygon. We also have a TTB polygon and in order to examine the interaction of these two entities it is necessary to either subset and quantify the **area of overlap** between the two areas, or else reduce one of the areas to a point geometry and use the **binary aspect** of spatial overlap. Since we are also dealing with TTBs which have common origines, it makes sense to reduce the Small Area polygon to a point (in this case using the *point on surface* tool from QGIS).
+
+One technical issue encountered is that the polygons produced by the ORS process seem to have a duplicate point at the origin of the rign, so this has been corrected by a QGIS topology checker. This might be because I wrote it directly to a geopackage layer, possibly the geojson output would be valid? In any case, using the checked geometry below allows a spatial join to be created, facilitating the analysis.
+
+```{r setup_and_loading}
+library(tidyverse)
+library(sf)
+library(magrittr)
+library(sf)
+
+irish_fire_stations <- st_read("../data/irish_fire_stations_wgs84.gpkg", layer = "irish_fire_stations_wgs84") %>% 
+  st_set_geometry(NULL)
+
+firestation_ttbs <- st_read("../op/fs_ttb.gpkg", layer = "fs_ttb_1to30_car") %>% 
+  st_transform(2157)
+
+pobal_2016_pt <- st_read("../data/demographics.gpkg", layer = "sa_pobal_deprivation_2016_pt") %>% 
+  st_transform(2157)
+pobal_2016_poly <- st_read("../data/demographics.gpkg", layer = "sa_pobal_deprivation_2016") %>% 
+  st_transform(2157)
+
+str(firestation_ttbs)
+str(pobal_2016_pt)
+```
+
+We have now loaded two datasets;
+
+1.  Travel-time Boundaries for Irish Fire Stations
+
+2.  Point on Surface of Small Area geometry, with Pobal attributes for 2016
+
+```{r joining_data}
+pobal_pts_with_containing_ttbs <- pobal_2016_pt %>%
+  select(GUID) %>% 
+  st_join(firestation_ttbs, 
+          join = st_intersects) %>% 
+  st_set_geometry(NULL) %>% 
+  select(-c(AA_MODE, TOTAL_POP))
+
+str(pobal_pts_with_containing_ttbs)
+```
+
+We now have a table of \~330,000 rows, corresponding to the intersection of the Small Areas with individual TTB polygons. The attributes of crucial interest are;
+
+-   **GUID** - this ocrresponds to the Small Area polygon
+
+-   **AA mins** - this is the range of the TTB
+
+-   **ID** - this is the identifier of the origin point for the TTB
+
+The AA mins and the ID together idenify a particular TTB.
+
+# Analysis
+
+What are we interested in?
+
+It is generally accepted that the faster a fire appliance can respond to a fire, the better the outcome with respect to rescues and property damage. So a key determinant might be the proportion of the population with the best possible fire service response. 
+
+Note that we must differentiate between full-time and retained stations. Per the "Keeping Communities Safe" document which sets out standards for Fire Service provision in Ireland, full-time crewed stations must respond from station (or "activate") within 90 seconds 75% of the time, while retained-crewed stations must respond within 300 seconds 75% of the time. We will examine the response on two fronts;  
+
+-   a travel-time basis, where the difference between retained and full-time is not counted
+-   a response-time basis where the difference is counted
+
+```{r calculate-min-max-travel}
+pobal_pts_with_containing_ttbs %>% 
+  group_by(GUID) %>% 
+  mutate(min_ttb = min(AA_MINS)) %>% 
+  filter(min_ttb == AA_MINS) %>% 
+  select(GUID, ID, min_ttb, AA_MINS) %>% 
+  group_by(GUID, AA_MINS) %>% 
+  summarise(ct = n(), 
+            first_stations = paste(ID, collapse = ' | ')) -> sa_first_responses
+
+sa_first_responses %>% distinct(GUID) -> intersected_guids
+
+pobal_2016_poly %>% 
+  filter(!(GUID %in% intersected_guids$GUID)) -> remote_SAs
+
+remote_pobal_sas_with_containing_ttbs <- remote_SAs %>%
+  select(GUID) %>% 
+  st_join(firestation_ttbs, 
+          join = st_intersects) %>% 
+  st_set_geometry(NULL)
+
+remote_pobal_sas_with_containing_ttbs %>% 
+  group_by(GUID) %>% 
+  mutate(min_ttb = min(AA_MINS)) %>% 
+  filter(min_ttb == AA_MINS) %>% 
+  select(GUID, ID, min_ttb, AA_MINS) %>% 
+  group_by(GUID, AA_MINS) %>% 
+  summarise(ct = n(), 
+            first_stations = paste(ID, collapse = ' | ')) -> remote_sa_first_responses
+
+remote_sa_first_responses %>% distinct(GUID) -> remote_guids
+
+no_30_min_resp_guid <- pobal_2016_poly %>% 
+  filter(!(GUID %in% intersected_guids$GUID | GUID %in% remote_guids$GUID)) %>% 
+  st_set_geometry(NULL) %>% 
+  select(GUID)
+
+
+all_sa_first_responses <- bind_rows("sas" = sa_first_responses, 
+                                    "remote_sas" = remote_sa_first_responses,
+                                    ">30min_sas" = no_30_min_resp_guid,
+                                     .id = "groups")
+
+all_sa_first_responses %>% 
+  mutate(join_stations = str_extract(first_stations, "(\\w+)|")) %>% 
+  left_join(irish_fire_stations %>% select(ID, Full_Time), by = c("join_stations" = "ID")) %>%
+  write_csv("../op/all_sa_first_responses.csv")
+```
+
